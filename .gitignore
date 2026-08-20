@@ -1,0 +1,55 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.egg
+.installed.cfg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Cursor agent files
+.cursor/
+.cursorignore
+.cursorrules
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Crawl outputs
+results/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
