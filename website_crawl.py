@@ -59,29 +59,11 @@ import requests
 from bs4 import BeautifulSoup
 
 try:
-    from playwright.sync_api import sync_playwright as _sync_playwright
-    _PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    _PLAYWRIGHT_AVAILABLE = False
-
-try:
-    from playwright_stealth import Stealth as _PlaywrightStealth
-    _STEALTH_AVAILABLE = True
-except ImportError:
-    _STEALTH_AVAILABLE = False
-
-try:
     from crawl4ai.content_filter_strategy import BM25ContentFilter as _BM25ContentFilter
     from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator as _C4AMarkdownGenerator
     _CRAWL4AI_AVAILABLE = True
 except ImportError:
     _CRAWL4AI_AVAILABLE = False
-
-try:
-    from curl_cffi import requests as _cffi_requests
-    _CURL_CFFI_AVAILABLE = True
-except ImportError:
-    _CURL_CFFI_AVAILABLE = False
 
 def _extract_text_crawl4ai(html: str, url: str, industry: str | None = None) -> str | None:
     """Use crawl4ai BM25ContentFilter to extract the most relevant content as clean markdown.
@@ -115,24 +97,6 @@ def _extract_text_crawl4ai(html: str, url: str, industry: str | None = None) -> 
     except Exception as exc:
         logger.debug("[C4A] Text extraction failed for %s: %s", url, exc)
         return None
-_BOT_ERROR_PATTERNS = re.compile(
-    r"(your browser did something unexpected"
-    r"|access denied"
-    r"|please enable javascript"
-    r"|checking your browser"
-    r"|cloudflare ray id"
-    r"|error[:\s]+E\d{4,}"
-    r"|ddos protection"
-    r"|verify you are human"
-    r"|KPSDK\.challenge"
-    r"|window\.KPSDK\s*="
-    r"|ks-invalid"
-    r"|kasada"
-    r"|_cf_chl_opt"
-    r"|perimeterx"
-    r"|px-captcha)",
-    re.I,
-)
 from django.conf import settings
 from django.db import close_old_connections, transaction
 from django.utils import timezone
@@ -258,18 +222,6 @@ MAX_PAGE_CHARS = 6000
 FETCH_TIMEOUT = 15
 FETCH_MAX_RETRIES = 3
 FETCH_RETRY_DELAYS = (1.0, 2.0, 4.0)
-
-# Optional ScraperAPI key — set env var SCRAPERAPI_KEY to enable as a fallback
-# for sites protected by Kasada, Akamai, or Cloudflare.
-# Get a free key at https://www.scraperapi.com/
-SCRAPERAPI_KEY: str | None = os.environ.get("SCRAPERAPI_KEY") or None
-SCRAPERAPI_URL = "https://api.scraperapi.com"
-
-# Optional ZenRows key — alternative to ScraperAPI, explicitly supports Kasada.
-# Get a free key (1000 credits) at https://www.zenrows.com/
-# JS rendering costs 5 credits/request → 200 free Kasada-protected pages.
-ZENROWS_KEY: str | None = os.environ.get("ZENROWS_KEY") or None
-ZENROWS_URL = "https://api.zenrows.com/v1/"
 
 MAX_LINKS_PER_PAGE = 400
 MAX_IMAGES_PER_PAGE = 60
@@ -666,33 +618,6 @@ def _request_is_retriable(exc: Exception) -> bool:
 
 
 def _http_get(url: str) -> requests.Response:
-    # curl_cffi impersonates a real Chrome TLS fingerprint — bypasses Akamai/Cloudflare TLS checks
-    if _CURL_CFFI_AVAILABLE:
-        try:
-            resp = _cffi_requests.get(
-                url,
-                headers=DEFAULT_HEADERS,
-                timeout=FETCH_TIMEOUT,
-                impersonate="chrome131",
-                verify=True,
-            )
-            resp.raise_for_status()
-            return resp
-        except Exception:
-            # SSL error fallback
-            try:
-                resp = _cffi_requests.get(
-                    url,
-                    headers=DEFAULT_HEADERS,
-                    timeout=FETCH_TIMEOUT,
-                    impersonate="chrome131",
-                    verify=False,
-                )
-                resp.raise_for_status()
-                return resp
-            except Exception:
-                pass  # fall through to standard requests below
-
     try:
         response = requests.get(url, headers=DEFAULT_HEADERS, timeout=FETCH_TIMEOUT, verify=True)
         response.raise_for_status()
@@ -703,280 +628,20 @@ def _http_get(url: str) -> requests.Response:
         return response
 
 
-def _browser_fetch(url: str) -> requests.Response | None:
-    """Fetch a page using a real Chromium browser (Playwright).
-
-    Used as a fallback when requests gets a 403/429 from bot-protection.
-    Returns a fake Response-like object with .content set to the page HTML bytes,
-    or None if the fetch fails.
-    """
-    if not _PLAYWRIGHT_AVAILABLE:
-        logger.warning("Playwright not installed — cannot bypass bot protection for %s", url)
-        return None
-
-    logger.info("[BROWSER] Launching Chromium for %s", url)
-    try:
-        with _sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-infobars",
-                    "--disable-background-networking",
-                    "--disable-default-apps",
-                    "--disable-sync",
-                    "--disable-translate",
-                    "--hide-scrollbars",
-                    "--metrics-recording-only",
-                    "--mute-audio",
-                    "--no-first-run",
-                    "--safebrowsing-disable-auto-update",
-                    "--window-size=1280,900",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                locale="en-US",
-                timezone_id="America/New_York",
-                viewport={"width": 1280, "height": 900},
-                java_script_enabled=True,
-                has_touch=False,
-                is_mobile=False,
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"macOS"',
-                },
-            )
-            page = context.new_page()
-
-            # Apply stealth patches to hide headless indicators
-            if _STEALTH_AVAILABLE:
-                _PlaywrightStealth().apply_stealth_sync(page)
-
-            # Remove webdriver flag and patch navigator properties before any navigation
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'permissions', {
-                    get: () => ({
-                        query: (p) => (
-                            p.name === 'notifications'
-                                ? Promise.resolve({ state: Notification.permission })
-                                : Promise.resolve({ state: 'granted' })
-                        )
-                    })
-                });
-            """)
-
-            # Navigate: wait for DOM ready first, then settle
-            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=12_000)
-            except Exception:
-                pass
-
-            # Human-like: pause, then scroll gradually through the page
-            page.wait_for_timeout(2500)
-            page.evaluate("window.scrollTo({ top: document.body.scrollHeight * 0.3, behavior: 'smooth' })")
-            page.wait_for_timeout(1000)
-            page.evaluate("window.scrollTo({ top: document.body.scrollHeight * 0.6, behavior: 'smooth' })")
-            page.wait_for_timeout(1000)
-
-            html = page.content()
-
-            # If a challenge page is detected, wait longer and give it time to resolve
-            if _BOT_ERROR_PATTERNS.search(html):
-                logger.info(
-                    "[BROWSER] Challenge page detected for %s — waiting for JS challenge to resolve …",
-                    url,
-                )
-                page.wait_for_timeout(5000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=8_000)
-                except Exception:
-                    pass
-                html = page.content()
-
-            browser.close()
-
-        # Only treat as a true failure when the page is tiny AND matches a bot pattern
-        if _BOT_ERROR_PATTERNS.search(html) and len(html) < 8000:
-            logger.warning(
-                "[BROWSER] Got bot-detection page for %s — site likely requires "
-                "a residential proxy or manual login to crawl",
-                url,
-            )
-            return None
-
-        # Wrap in a fake Response so the rest of the pipeline works unchanged
-        fake = requests.Response()
-        fake.status_code = 200
-        fake._content = html.encode("utf-8", errors="replace")
-        fake.encoding = "utf-8"
-        logger.info("[BROWSER] Chromium fetch succeeded for %s (%d chars)", url, len(html))
-        return fake
-    except Exception as exc:
-        logger.warning("[BROWSER] Chromium fetch failed for %s: %s", url, exc)
-        return None
-
-
-def _scraper_api_fetch(url: str) -> requests.Response | None:
-    """Fetch via ScraperAPI — handles Kasada, Cloudflare, Akamai with real browser rendering.
-
-    Requires SCRAPERAPI_KEY environment variable.
-    """
-    if not SCRAPERAPI_KEY:
-        return None
-    logger.info("[SCRAPERAPI] Fetching %s via ScraperAPI ...", url)
-    try:
-        resp = requests.get(
-            SCRAPERAPI_URL,
-            params={
-                "api_key": SCRAPERAPI_KEY,
-                "url": url,
-                "render": "true",
-                "country_code": "us",
-                "keep_headers": "true",
-            },
-            timeout=90,
-        )
-        resp.raise_for_status()
-        logger.info("[SCRAPERAPI] Success for %s (%d chars)", url, len(resp.text))
-        return resp
-    except Exception as exc:
-        logger.warning("[SCRAPERAPI] Failed for %s: %s", url, exc)
-        return None
-
-
-def _zenrows_fetch(url: str) -> requests.Response | None:
-    """Fetch via ZenRows — explicitly supports Kasada, Cloudflare, Akamai.
-
-    Requires ZENROWS_KEY environment variable.
-    Free tier: 1000 credits; JS rendering costs 5 credits/request.
-    Get a key at https://www.zenrows.com/
-    """
-    if not ZENROWS_KEY:
-        return None
-    logger.info("[ZENROWS] Fetching %s via ZenRows ...", url)
-    try:
-        resp = requests.get(
-            ZENROWS_URL,
-            params={
-                "apikey": ZENROWS_KEY,
-                "url": url,
-                "js_render": "true",
-                "antibot": "true",
-                "premium_proxy": "true",
-            },
-            timeout=90,
-        )
-        resp.raise_for_status()
-        logger.info("[ZENROWS] Success for %s (%d chars)", url, len(resp.text))
-        return resp
-    except Exception as exc:
-        logger.warning("[ZENROWS] Failed for %s: %s", url, exc)
-        return None
-
-
-def _wayback_machine_fetch(url: str) -> requests.Response | None:
-    """Try to retrieve the most recent cached copy from the Wayback Machine.
-
-    Used as a last-resort fallback for bot-protected pages.
-    """
-    logger.info("[WAYBACK] Looking up archived copy of %s ...", url)
-    try:
-        avail_url = f"https://archive.org/wayback/available?url={url}"
-        meta = requests.get(avail_url, timeout=10, headers={"User-Agent": DEFAULT_HEADERS["User-Agent"]})
-        if not meta.content:
-            logger.info("[WAYBACK] Empty response from availability API for %s", url)
-            return None
-        data = meta.json()
-        snapshot = data.get("archived_snapshots", {}).get("closest", {})
-        if not snapshot.get("available"):
-            logger.info("[WAYBACK] No archived snapshot found for %s", url)
-            return None
-        archive_url = snapshot["url"]
-        logger.info("[WAYBACK] Found snapshot: %s", archive_url)
-        resp = requests.get(archive_url, headers=DEFAULT_HEADERS, timeout=FETCH_TIMEOUT)
-        resp.raise_for_status()
-        logger.info("[WAYBACK] Retrieved archived copy for %s (%d chars)", url, len(resp.text))
-        return resp
-    except Exception as exc:
-        logger.warning("[WAYBACK] Failed for %s: %s", url, exc)
-        return None
-
-
 def fetch_response(url: str) -> requests.Response | None:
-    """GET with bounded retries.
-
-    Fallback chain:
-      1. curl_cffi (Chrome TLS fingerprint) / requests
-      2. Playwright headless browser with stealth
-      3. ScraperAPI (if SCRAPERAPI_KEY is set)
-      4. Wayback Machine archived copy
-    """
+    """GET with bounded retries."""
     url = normalize_url(url)
     last_exc: Exception | None = None
-    got_bot_block = False
 
     for attempt in range(FETCH_MAX_RETRIES):
         try:
             return _http_get(url)
-        except requests.exceptions.HTTPError as exc:
-            last_exc = exc
-            if exc.response is not None and exc.response.status_code in (403, 429):
-                got_bot_block = True
-                break
-            if attempt < FETCH_MAX_RETRIES - 1 and _request_is_retriable(exc):
-                time.sleep(FETCH_RETRY_DELAYS[attempt])
-                continue
-            break
         except Exception as exc:
             last_exc = exc
-            # curl_cffi raises its own HTTPError subclass — detect 403/429 by message
-            exc_str = str(exc).lower()
-            if "403" in exc_str or "429" in exc_str or "forbidden" in exc_str:
-                got_bot_block = True
-                break
             if attempt < FETCH_MAX_RETRIES - 1 and _request_is_retriable(exc):
                 time.sleep(FETCH_RETRY_DELAYS[attempt])
                 continue
             break
-
-    if got_bot_block:
-        # Fallback 2: Playwright browser
-        if _PLAYWRIGHT_AVAILABLE:
-            logger.info("Bot protection detected for %s — retrying with Chromium browser", url)
-            result = _browser_fetch(url)
-            if result is not None:
-                return result
-
-        # Fallback 3: ScraperAPI (handles Kasada, Cloudflare, Akamai)
-        result = _scraper_api_fetch(url)
-        if result is not None:
-            return result
-
-        # Fallback 4: ZenRows (explicitly supports Kasada — alternative to ScraperAPI)
-        result = _zenrows_fetch(url)
-        if result is not None:
-            return result
-
-        # Fallback 5: Wayback Machine archived copy
-        result = _wayback_machine_fetch(url)
-        if result is not None:
-            return result
 
     logger.warning("Failed to fetch %s after %s attempts: %s", url, FETCH_MAX_RETRIES, last_exc)
     return None
